@@ -13,6 +13,10 @@ const uint8_t PIN_RST = 27; // reset pin
 const uint8_t PIN_IRQ = 34; // irq pin
 const uint8_t PIN_SS = 4;   // spi select pin
 
+// Calibrated antenna delay for THIS board (AntennaDelayCalibration.ino).
+// Every board gets its own measured value - don't just copy this number.
+#define ANTENNA_DELAY 16535  // <-- Calibrated via Least-Squares 4-Delay solver (Anchor 2: 90,0 cm)
+
 void setup()
 {
     Serial.begin(115200);
@@ -20,6 +24,10 @@ void setup()
     //init the configuration
     SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
     DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ); //Reset, CS, IRQ pin
+
+    // *** calibrated antenna delay -- set BEFORE startAsAnchor() ***
+    DW1000.setAntennaDelay(ANTENNA_DELAY);
+
     //define the sketch as anchor. It will be great to dynamically change the type of module
     DW1000Ranging.attachNewRange(newRange);
     DW1000Ranging.attachBlinkDevice(newBlink);
@@ -38,24 +46,36 @@ void loop()
 
 void newRange()
 {
-    // Check if packet contains our magic marker (0x77, 0x88) from Tag at bytes 70 and 71
+    // Check if packet contains our magic marker (0x77, 0x88) from Tag at bytes 70 and 71.
+    // The Tag no longer does any position math -- it just forwards its three raw,
+    // median-filtered ranges. We just relay them as-is; uwb_solver.py on the PC
+    // does the trilateration and EKF smoothing.
     if (DW1000Ranging.data[70] == 0x77 && DW1000Ranging.data[71] == 0x88)
     {
-        float tag_x, tag_y, r1, r2;
-        memcpy(&tag_x, &DW1000Ranging.data[72], sizeof(float));
-        memcpy(&tag_y, &DW1000Ranging.data[76], sizeof(float));
-        memcpy(&r1, &DW1000Ranging.data[80], sizeof(float));
-        memcpy(&r2, &DW1000Ranging.data[84], sizeof(float));
+        float r1, r2, r3;
+        memcpy(&r1, &DW1000Ranging.data[72], sizeof(float));
+        memcpy(&r2, &DW1000Ranging.data[76], sizeof(float));
+        memcpy(&r3, &DW1000Ranging.data[80], sizeof(float));
+        int8_t p1 = (int8_t)DW1000Ranging.data[84];
+        int8_t p2 = (int8_t)DW1000Ranging.data[85];
+        int8_t p3 = (int8_t)DW1000Ranging.data[86];
 
-        // Format as JSON and send to PC over Serial
-        Serial.print("{\"x\":");
-        Serial.print(tag_x, 2);
-        Serial.print(",\"y\":");
-        Serial.print(tag_y, 2);
-        Serial.print(",\"links\":[{\"A\":\"1782\",\"R\":\"");
-        Serial.print(r1, 2);
+        // Format as JSON and send to PC over Serial. Anchor labels ("1782",
+        // "1783", "1784") must match the ANCHORS dict keys in uwb_solver.py.
+        // "P" is RX power in dBm - lets the PC-side EKF trust weak/NLOS
+        // links less, in real time, as the tag moves.
+        Serial.print("{\"links\":[{\"A\":\"1782\",\"R\":\"");
+        Serial.print(r1, 3);
+        Serial.print("\",\"P\":\"");
+        Serial.print(p1);
         Serial.print("\"},{\"A\":\"1783\",\"R\":\"");
-        Serial.print(r2, 2);
+        Serial.print(r2, 3);
+        Serial.print("\",\"P\":\"");
+        Serial.print(p2);
+        Serial.print("\"},{\"A\":\"1784\",\"R\":\"");
+        Serial.print(r3, 3);
+        Serial.print("\",\"P\":\"");
+        Serial.print(p3);
         Serial.println("\"}]}");
     }
     else

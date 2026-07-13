@@ -10,110 +10,47 @@
 #define PIN_RST 27
 #define PIN_IRQ 34
 
+// ----------------------------------------------------------------------
+// ANTENNA DELAY - calibrated per-device via AntennaDelayCalibration.ino
+// (Decawave APS014 method). This replaces the old runtime auto-offset
+// entirely. Every board gets its OWN measured value; they'll be close
+// but flash each device with its own number, not just this one.
+// ----------------------------------------------------------------------
+#define ANTENNA_DELAY 16493  // <-- Calibrated via Least-Squares 4-Delay solver
+
 struct MyLink *uwb_data;
 unsigned long runtime = 0;
 
-float tag_x = 0.0;
-float tag_y = 0.0;
-float range_a1 = 0.0; // Corrected range to Anchor 1
-float range_a2 = 0.0; // Corrected range to Anchor 2
-bool pos_calculated = false;
+// Raw (median-filtered only) ranges to each anchor. No offset subtraction,
+// no EMA - the antenna delay register handles the constant bias now, and
+// the PC-side EKF (uwb_solver.py) handles the smoothing.
+float range_a1 = 0.0; // range to Anchor 1
+float range_a2 = 0.0; // range to Anchor 2
+float range_a3 = 0.0; // range to Anchor 3
+bool ranges_ready = false;
 
-const float DISTANCE_A1_A2 = 1.25; // Actual measured distance between Anchor 1 and Anchor 2 in meters
+// RX power (dBm) per anchor. This is what actually changes as the tag
+// moves - closer/LOS = strong (e.g. -70), farther/obstructed = weak
+// (e.g. -95+). Forwarded to the PC so the EKF can trust weak links less
+// in real time, instead of treating every range as equally reliable.
+int8_t power_a1 = -100, power_a2 = -100, power_a3 = -100;
 
-// --- EMA Smoothing ---
-const float EMA_ALPHA = 0.2;        // Smoothing factor (0.1=very smooth, 0.5=responsive)
 const float MAX_VALID_RANGE = 10.0;  // Reject ranges above this (meters)
 const float MIN_VALID_RANGE = 0.01;  // Reject ranges below this (meters)
-float ema_r1 = -1.0;  // EMA filtered raw range to Anchor 1
-float ema_r2 = -1.0;  // EMA filtered raw range to Anchor 2
-
-// ============================================================
-// AUTO-CALIBRATION: Dynamic Range Offset Correction
-// ============================================================
-// The DW1000 antenna delay adds a CONSTANT offset (delta) to
-// every range measurement:
-//   measured_range = true_range + delta
-//
-// We exploit the known baseline (1.25m between anchors):
-//   For ANY tag position: r1_true + r2_true >= baseline
-//   (equality when tag is on the line between anchors)
-//
-// So: min(r1_meas + r2_meas) = baseline + 2*delta
-//     => delta = (min_sum - baseline) / 2
-//
-// The Tag continuously tracks the minimum range sum and
-// auto-computes the offset. As the tag moves around, the
-// estimate improves automatically.
-// ============================================================
-float range_offset = 0.0;           // Auto-computed per-range offset (subtracted from each raw range)
-float min_range_sum = 999.0;        // Tracked minimum of (r1_raw + r2_raw)
-const float MIN_SUM_DECAY = 0.0005; // Slowly increase min_sum so it adapts if conditions change
-unsigned long cal_sample_count = 0; // How many calibration samples we've collected
-
-// Store latest raw (unfiltered, uncorrected) ranges for offset calculation
-float latest_raw_r1 = -1.0;
-float latest_raw_r2 = -1.0;
-
-void calculate_tag_pos(float a, float b, float c, float *x, float *y)
-{
-    // a: corrected distance to Anchor 2
-    // b: corrected distance to Anchor 1
-    // c: distance between anchors (1.25m)
-    if (b <= 0.0 || c <= 0.0) return;
-    float cos_a = (b * b + c * c - a * a) / (2.0 * b * c);
-    if (cos_a > 1.0) cos_a = 1.0;
-    if (cos_a < -1.0) cos_a = -1.0;
-    *x = b * cos_a;
-    float sin_a_sq = 1.0 - cos_a * cos_a;
-    if (sin_a_sq < 0.0) sin_a_sq = 0.0;
-    *y = b * sqrt(sin_a_sq);
-
-    // Round to 2 decimal places (1cm resolution)
-    *x = round((*x) * 100.0) / 100.0;
-    *y = round((*y) * 100.0) / 100.0;
-}
-
-void update_auto_calibration()
-{
-    // We need both raw ranges to compute the sum
-    if (latest_raw_r1 <= 0.0 || latest_raw_r2 <= 0.0) return;
-
-    float current_sum = latest_raw_r1 + latest_raw_r2;
-
-    // Update minimum range sum tracker
-    if (current_sum < min_range_sum)
-    {
-        min_range_sum = current_sum; // New minimum found
-    }
-    else
-    {
-        // Slowly decay (increase) the minimum so it adapts over time
-        // This prevents a single noise spike from locking the offset forever
-        min_range_sum += MIN_SUM_DECAY;
-    }
-
-    // Compute offset: delta = (min_sum - baseline) / 2
-    // Only apply if min_sum > baseline (offset should be positive or zero)
-    float new_offset = (min_range_sum - DISTANCE_A1_A2) / 2.0;
-    if (new_offset < 0.0) new_offset = 0.0;
-
-    // Smooth the offset update to prevent jumps
-    if (cal_sample_count == 0)
-        range_offset = new_offset;
-    else
-        range_offset = 0.05 * new_offset + 0.95 * range_offset; // Very slow adaptation
-
-    cal_sample_count++;
-}
 
 // --- 5-sample Moving Median Filter to eliminate multipath spikes ---
 float median_buf_r1[5] = {0};
 float median_buf_r2[5] = {0};
-int median_idx_r1 = 0;
-int median_idx_r2 = 0;
-int median_cnt_r1 = 0;
-int median_cnt_r2 = 0;
+float median_buf_r3[5] = {0};
+int median_idx_r1 = 0, median_idx_r2 = 0, median_idx_r3 = 0;
+int median_cnt_r1 = 0, median_cnt_r2 = 0, median_cnt_r3 = 0;
+
+int8_t clamp_power(float dbm)
+{
+    if (dbm > 0) dbm = 0;
+    if (dbm < -128) dbm = -128;
+    return (int8_t)dbm;
+}
 
 float get_median(float buf[], int count)
 {
@@ -136,14 +73,15 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("=== UWB Tag - 64MHz High Accuracy + Median/EMA Filter ===");
-    Serial.print("Known baseline: ");
-    Serial.print(DISTANCE_A1_A2, 2);
-    Serial.println(" m");
+    Serial.println("=== UWB Tag - raw range forwarding (PC does the solve) ===");
 
     // init the configuration
     SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
     DW1000Ranging.initCommunication(PIN_RST, DW_CS, PIN_IRQ);
+
+    // *** calibrated antenna delay -- set BEFORE startAsTag() ***
+    DW1000.setAntennaDelay(ANTENNA_DELAY);
+
     DW1000Ranging.attachNewRange(newRange);
     DW1000Ranging.attachNewDevice(newDevice);
     DW1000Ranging.attachInactiveDevice(inactiveDevice);
@@ -161,35 +99,32 @@ void loop()
 {
     DW1000Ranging.loop();
 
-    // Embed calculated position and ranges into DW1000Ranging data buffer (bytes 70..87)
-    if (pos_calculated)
+    // Embed raw ranges + RX power into the DW1000Ranging data buffer
+    // (bytes 70..86) so Anchor 2 can relay them to the PC. No position
+    // math happens here any more - three range floats + three power
+    // bytes behind the magic header.
+    if (ranges_ready)
     {
         DW1000Ranging.data[70] = 0x77;
         DW1000Ranging.data[71] = 0x88;
-        memcpy(&DW1000Ranging.data[72], &tag_x, sizeof(float));
-        memcpy(&DW1000Ranging.data[76], &tag_y, sizeof(float));
-        memcpy(&DW1000Ranging.data[80], &range_a1, sizeof(float));
-        memcpy(&DW1000Ranging.data[84], &range_a2, sizeof(float));
+        memcpy(&DW1000Ranging.data[72], &range_a1, sizeof(float));
+        memcpy(&DW1000Ranging.data[76], &range_a2, sizeof(float));
+        memcpy(&DW1000Ranging.data[80], &range_a3, sizeof(float));
+        DW1000Ranging.data[84] = (uint8_t)power_a1;
+        DW1000Ranging.data[85] = (uint8_t)power_a2;
+        DW1000Ranging.data[86] = (uint8_t)power_a3;
     }
 
     if ((millis() - runtime) > 1000)
     {
-        if (pos_calculated)
+        if (ranges_ready)
         {
-            Serial.print("POS X:");
-            Serial.print(tag_x, 2);
-            Serial.print(" Y:");
-            Serial.print(tag_y, 2);
-            Serial.print(" | R1:");
-            Serial.print(range_a1, 2);
+            Serial.print("R1:");
+            Serial.print(range_a1, 3);
             Serial.print(" R2:");
-            Serial.print(range_a2, 2);
-            Serial.print(" | offset:");
-            Serial.print(range_offset, 3);
-            Serial.print(" minSum:");
-            Serial.print(min_range_sum, 3);
-            Serial.print(" samples:");
-            Serial.println(cal_sample_count);
+            Serial.print(range_a2, 3);
+            Serial.print(" R3:");
+            Serial.println(range_a3, 3);
         }
         runtime = millis();
     }
@@ -211,52 +146,44 @@ void newRange()
 
     bool is_anchor1 = (addr == 0x24DC || addr == 0x8217 || addr == 0x1782 || addr == 0xDCC7);
     bool is_anchor2 = (addr == 0x64B7 || addr == 0x8317 || addr == 0x1783 || addr == 0xB764);
+    bool is_anchor3 = (addr == 0x1784 || addr == 0x8417 || addr == 0x84DC);
 
     if (is_anchor1)
     {
         median_buf_r1[median_idx_r1] = range;
         median_idx_r1 = (median_idx_r1 + 1) % 5;
         if (median_cnt_r1 < 5) median_cnt_r1++;
-        float med_range = get_median(median_buf_r1, median_cnt_r1);
-
-        latest_raw_r1 = med_range; // store median range for calibration
-        if (ema_r1 < 0.0)
-            ema_r1 = med_range;
-        else
-            ema_r1 = EMA_ALPHA * med_range + (1.0 - EMA_ALPHA) * ema_r1;
+        range_a1 = get_median(median_buf_r1, median_cnt_r1);
+        power_a1 = clamp_power(dbm);
     }
     else if (is_anchor2)
     {
         median_buf_r2[median_idx_r2] = range;
         median_idx_r2 = (median_idx_r2 + 1) % 5;
         if (median_cnt_r2 < 5) median_cnt_r2++;
-        float med_range = get_median(median_buf_r2, median_cnt_r2);
-
-        latest_raw_r2 = med_range; // store median range for calibration
-        if (ema_r2 < 0.0)
-            ema_r2 = med_range;
-        else
-            ema_r2 = EMA_ALPHA * med_range + (1.0 - EMA_ALPHA) * ema_r2;
+        range_a2 = get_median(median_buf_r2, median_cnt_r2);
+        power_a2 = clamp_power(dbm);
+    }
+    else if (is_anchor3)
+    {
+        median_buf_r3[median_idx_r3] = range;
+        median_idx_r3 = (median_idx_r3 + 1) % 5;
+        if (median_cnt_r3 < 5) median_cnt_r3++;
+        range_a3 = get_median(median_buf_r3, median_cnt_r3);
+        power_a3 = clamp_power(dbm);
     }
     else
     {
         return;
     }
 
-    // --- Auto-calibrate offset using raw range sums ---
-    update_auto_calibration();
-
-    // --- Calculate position with offset-corrected, EMA-smoothed ranges ---
-    if (ema_r1 > 0.0 && ema_r2 > 0.0)
+    // The PC solver only needs >=2 anchors to get a fix (3 to fully kill
+    // the half-plane ambiguity), so start forwarding as soon as we have
+    // at least two valid ranges rather than waiting on all three.
+    int have = (range_a1 > 0.0) + (range_a2 > 0.0) + (range_a3 > 0.0);
+    if (have >= 2)
     {
-        range_a1 = ema_r1 - range_offset;
-        range_a2 = ema_r2 - range_offset;
-
-        if (range_a1 < 0.01) range_a1 = 0.01;
-        if (range_a2 < 0.01) range_a2 = 0.01;
-
-        calculate_tag_pos(range_a2, range_a1, DISTANCE_A1_A2, &tag_x, &tag_y);
-        pos_calculated = true;
+        ranges_ready = true;
     }
 }
 

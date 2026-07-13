@@ -1,7 +1,11 @@
 #include <SPI.h>
 #include "DW1000Ranging.h"
 
-#define ANCHOR_ADD "82:17:5B:D5:A9:9A:E2:9C"
+// New third anchor. Short address resolves to 0x1784, matching the "1784"
+// key in ANCHORS inside uwb_solver.py. Physically place this one OFF the
+// A1-A2 line -- that's what kills the half-plane ("wall") ambiguity and
+// gives full XY coverage instead of just a half-plane.
+#define ANCHOR_ADD "84:17:5B:D5:A9:9A:E2:9C"
 
 #define SPI_SCK 18
 #define SPI_MISO 19
@@ -15,7 +19,7 @@ const uint8_t PIN_SS = 4;   // spi select pin
 
 // Calibrated antenna delay for THIS board (AntennaDelayCalibration.ino).
 // Every board gets its own measured value - don't just copy this number.
-#define ANTENNA_DELAY 16409  // <-- Calibrated via Least-Squares 4-Delay solver (Anchor 1: 0,0 cm)
+#define ANTENNA_DELAY 16535  // <-- Calibrated via Least-Squares 4-Delay solver (Anchor 3: 0,90 cm)
 
 void setup()
 {
